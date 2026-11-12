@@ -1,55 +1,79 @@
-const { herramientasGemini, ejecutarComandoLinux } = require('./tools.js');
+const { ejecutarComandoLinux } = require('./tools.js');
 const fs = require('fs');
 const path = require('path');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-
-// Cargar variables de entorno desde .env
-try {
-    process.loadEnvFile(path.join(__dirname, '.env'));
-} catch (_) {
-    // Si no existe .env, continúa sin problema
-}
 
 // ============================================================================
-// CONFIGURACIÓN DE GEMINI API Y HERRAMIENTAS (TOOLS)
+// CONFIGURACIÓN DE OLLAMA LOCAL (GTX 1650 - 4GB VRAM)
 // ============================================================================
-const apiKey = process.env.GOOGLE_AI_STUDIO_API_KEY;
-if (!apiKey) {
-    console.error('⚠️ ERROR: No se encontró GOOGLE_AI_STUDIO_API_KEY en tu archivo .env');
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/chat';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2:3b'; // O 'qwen2.5:3b'
+const MAX_ITERATIONS = 5;
+const MAX_HISTORY_MESSAGES = 10; // 5 turnos para no saturar los 4 GB de VRAM
+
+const SYSTEM_PROMPT = `Eres el asistente autónomo personal de Fran operando directamente en su laptop HP Victus con CachyOS (Arch Linux) a través de WhatsApp.
+Tu única forma de responder al sistema es devolviendo UN ÚNICO objeto JSON válido. NUNCA escribas texto fuera del JSON.
+
+REGLAS DE FLUJO:
+1. Analiza lo que pide Fran.
+2. Si necesitas inspeccionar el sistema, leer archivos, ver el estado del hardware o ejecutar cualquier acción en Linux, llena el campo "accion" con la herramienta "ejecutar_comando_linux" y deja "respuesta_final" en null.
+3. Cuando ya tengas el resultado del comando (o si es charla normal), pon "accion" en null y escribe tu respuesta clara y conversacional en español dentro de "respuesta_final". Nunca pidas confirmación antes de ejecutar un comando de lectura o diagnóstico: ejecútalo directamente.
+
+ESQUEMA JSON OBLIGATORIO:
+{
+  "pensamiento": "Razonamiento breve de lo que debes hacer ahora",
+  "accion": {
+    "herramienta": "ejecutar_comando_linux",
+    "parametros": {
+      "comando": "comando bash exacto a ejecutar"
+    }
+  },
+  "respuesta_final": null
 }
 
-const genAI = new GoogleGenerativeAI(apiKey);
+EJEMPLO 1 (Cuando necesitas usar la terminal):
+{
+  "pensamiento": "Fran pregunta cuánta VRAM está usando la GTX 1650. Ejecutaré nvidia-smi.",
+  "accion": {
+    "herramienta": "ejecutar_comando_linux",
+    "parametros": {
+      "comando": "nvidia-smi --query-gpu=memory.used,memory.total --format=csv"
+    }
+  },
+  "respuesta_final": null
+}
 
-// Instanciar el modelo con instrucciones de sistema y acceso a comandos Linux
-const aiModel = genAI.getGenerativeModel({ 
-    model: 'gemini-3.8-flash-lite',
-    systemInstruction: "Estás conversando con Fran a través de WhatsApp. Responde siempre en español, con lenguaje natural, conversacional y claro. Nunca uses menús de opciones numéricas ni pidas confirmación para ejecutar herramientas, hazlo directamente usando tu herramienta ejecutar_comando_linux.",
-    tools: [herramientasGemini]
-});
+EJEMPLO 2 (Cuando ya tienes el dato o conversas con Fran):
+{
+  "pensamiento": "Ya tengo la salida del comando, le respondo directamente a Fran.",
+  "accion": null,
+  "respuesta_final": "Actualmente la GTX 1650 está ocupando 2350 MiB de los 4096 MiB disponibles."
+}`;
 
-// Archivo donde persistimos el historial de la conversación con Gemini
-const HISTORY_FILE = path.join(__dirname, '.gemini_history.json');
-let chatSession;
+// Archivo donde persistimos el historial limpio de la conversación con Ollama
+const HISTORY_FILE = path.join(__dirname, '.ollama_history.json');
+let chatHistory = [];
 
 function inicializarChat() {
-    let history = [];
+    chatHistory = [];
     try {
         if (fs.existsSync(HISTORY_FILE)) {
             const raw = fs.readFileSync(HISTORY_FILE, 'utf8');
-            history = JSON.parse(raw);
+            chatHistory = JSON.parse(raw);
         }
     } catch (e) {
         console.error('Iniciando historial de conversación limpio.');
+        chatHistory = [];
     }
-    chatSession = aiModel.startChat({ history });
 }
 
-async function guardarHistorial() {
+function guardarHistorial() {
     try {
-        const history = await chatSession.getHistory();
-        fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
+        if (chatHistory.length > MAX_HISTORY_MESSAGES) {
+            chatHistory = chatHistory.slice(chatHistory.length - MAX_HISTORY_MESSAGES);
+        }
+        fs.writeFileSync(HISTORY_FILE, JSON.stringify(chatHistory, null, 2));
     } catch (e) {
         console.error('Error al guardar historial:', e);
     }
@@ -112,8 +136,8 @@ client.on('ready', async () => {
     });
 
     const miNumero = client.info && client.info.wid ? client.info.wid._serialized : 'desconocido';
-    console.log(`¡Cliente de WhatsApp conectado (${miNumero}) y vinculado con Google Gemini!`);
-    console.log('Escribe, envía notas de voz o imágenes en tu grupo "agy" de WhatsApp para conversar.');
+    console.log(`¡Cliente de WhatsApp conectado (${miNumero}) y vinculado con Ollama (${OLLAMA_MODEL})!`);
+    console.log('Escribe, envía notas de voz o archivos en tu grupo "agy" de WhatsApp para conversar.');
 });
 
 /**
@@ -242,80 +266,108 @@ function obtenerExtensionMedia(mimetype, filename) {
     return mapa[cleanMime] || '.bin';
 }
 
-// Función auxiliar para reintentar si Google devuelve 503 por saturación temporal
-async function enviarConReintento(session, payload, maxIntentos = 3) {
-    for (let intento = 1; intento <= maxIntentos; intento++) {
-        try {
-            return await session.sendMessage(payload);
-        } catch (error) {
-            const es503 = error.message && (error.message.includes('503') || error.message.includes('high demand'));
-            if (es503 && intento < maxIntentos) {
-                const esperaSegundos = intento * 2;
-                console.warn(`[Gemini] Servidores de Google con alta demanda (503). Reintentando en ${esperaSegundos}s (intento ${intento}/${maxIntentos})...`);
-                await new Promise((r) => setTimeout(r, esperaSegundos * 1000));
-            } else {
-                throw error;
+/**
+ * Llama a la API local de Ollama forzando respuesta JSON.
+ */
+async function llamarOllamaJSON(messages) {
+    const response = await fetch(OLLAMA_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            model: OLLAMA_MODEL,
+            messages: messages,
+            format: 'json',
+            stream: false,
+            options: {
+                num_ctx: 8192,
+                temperature: 0.1,
+                keep_alive: -1
             }
-        }
+        })
+    });
+
+    if (!response.ok) {
+        throw new Error(`Error HTTP Ollama: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    try {
+        return JSON.parse(data.message.content);
+    } catch (err) {
+        console.error('[Ollama] JSON malformado:', data.message.content);
+        return {
+            pensamiento: 'Fallo de formato JSON',
+            accion: null,
+            respuesta_final: data.message.content || 'Error al estructurar la respuesta.'
+        };
     }
 }
 
 /**
- * Envía el prompt (y archivos multimedia) a Gemini, ejecuta comandos de Linux si el modelo lo solicita,
- * y devuelve la respuesta final.
+ * Bucle autónomo (ReAct) sobre Ollama: piensa, ejecuta comandos Linux si hace falta y responde.
  */
-async function consultarGemini(promptText, mediaObj = null) {
-    const payload = [];
+async function consultarOllama(promptText) {
+    const messages = [
+        { role: 'system', content: SYSTEM_PROMPT },
+        ...chatHistory,
+        { role: 'user', content: promptText }
+    ];
 
-    if (mediaObj && mediaObj.data) {
-        payload.push({
-            inlineData: {
-                data: mediaObj.data,
-                mimeType: mediaObj.mimetype.split(';')[0]
-            }
+    let respuestaFinal = 'Alcancé el límite de pasos intentando resolver la tarea.';
+
+    for (let paso = 1; paso <= MAX_ITERATIONS; paso++) {
+        console.log(`[Ollama Paso ${paso}/${MAX_ITERATIONS}] Pensando...`);
+        const decision = await llamarOllamaJSON(messages);
+
+        if (decision.pensamiento) {
+            console.log(`[Pensamiento]: ${decision.pensamiento}`);
+        }
+
+        messages.push({
+            role: 'assistant',
+            content: JSON.stringify(decision)
+        });
+
+        // Si el modelo pide usar la herramienta de terminal Linux
+        const comandoSolicitado =
+            decision.accion?.parametros?.comando ||
+            decision.accion?.comando;
+
+        if (decision.accion && comandoSolicitado) {
+            const salidaConsola = await ejecutarComandoLinux(comandoSolicitado);
+            messages.push({
+                role: 'user',
+                content: `[RESULTADO DE ejecutar_comando_linux]:\n${salidaConsola}\n\nAnaliza este resultado. Si ya tienes lo necesario para responder a Fran, pon "accion": null y escribe tu respuesta en "respuesta_final".`
+            });
+            continue;
+        }
+
+        if (decision.respuesta_final) {
+            respuestaFinal = String(decision.respuesta_final).trim();
+            break;
+        }
+
+        messages.push({
+            role: 'user',
+            content: 'Debes indicar un comando válido en "accion" o dar tu "respuesta_final" a Fran.'
         });
     }
 
-    payload.push(promptText);
-
-    // Primer envío con reintento automático
-    let result = await enviarConReintento(chatSession, payload);
-    let response = result.response;
-
-    // Procesar llamadas a herramientas por lote (Batch) para soportar múltiples comandos simultáneos
-    while (response.functionCalls() && response.functionCalls().length > 0) {
-        const functionResponses = [];
-
-        for (const call of response.functionCalls()) {
-            if (call.name === 'ejecutar_comando_linux') {
-                const { comando } = call.args;
-                const salidaConsola = await ejecutarComandoLinux(comando);
-                functionResponses.push({
-                    functionResponse: {
-                        name: 'ejecutar_comando_linux',
-                        response: { resultado: salidaConsola }
-                    }
-                });
-            }
+    // Guardamos solo el intercambio final limpio para cuidar los 4 GB de VRAM
+    chatHistory.push(
+        { role: 'user', content: promptText },
+        {
+            role: 'assistant',
+            content: JSON.stringify({
+                pensamiento: 'Respuesta entregada a Fran.',
+                accion: null,
+                respuesta_final: respuestaFinal
+            })
         }
+    );
+    guardarHistorial();
 
-        if (functionResponses.length === 0) break;
-
-        // Se envían todas las respuestas de las funciones juntas a Gemini
-        result = await enviarConReintento(chatSession, functionResponses);
-        response = result.response;
-    }
-
-    await guardarHistorial();
-
-    let textoFinal = '';
-    try {
-        textoFinal = response.text();
-    } catch (_) {
-        textoFinal = 'Tarea completada exitosamente.';
-    }
-
-    return (textoFinal || 'Listo.').trim();
+    return respuestaFinal;
 }
 
 /**
@@ -350,7 +402,6 @@ async function responderEnGrupoBot(message, texto) {
             mensajesDelBot.add(sentMsgId);
         }
     } catch (e) {
-        // Fallback nativo de whatsapp-web.js si falla la inyección de DOM
         const sent = await client.sendMessage(chatId, mensajeConPrefijo);
         if (sent && sent.id) {
             mensajesDelBot.add(sent.id._serialized);
@@ -378,22 +429,21 @@ client.on('message_create', async (message) => {
 
     // Soporte para notas de voz
     if (message.type === 'ptt' || message.type === 'audio') {
-        console.log('[WhatsApp -> Gemini]: Nota de voz recibida. Descargando y procesando...');
+        console.log('[WhatsApp -> Ollama]: Nota de voz recibida. Descargando...');
         try {
             const media = await descargarMediaSeguro(message);
             if (media && media.data) {
                 const tempAudioPath = '/tmp/whatsapp_nota_voz.ogg';
                 fs.writeFileSync(tempAudioPath, Buffer.from(media.data, 'base64'));
-                console.log(`Audio guardado en ${tempAudioPath}. Consultando a Gemini...`);
+                console.log(`Audio guardado en ${tempAudioPath}.`);
 
                 const contextoImagen = ultimoArchivoRecibido
-                    ? ` (Nota: El último archivo/imagen que envié está guardado en ${ultimoArchivoRecibido}, por si hago referencia a él en el audio).`
+                    ? ` (Además, el último archivo enviado está en ${ultimoArchivoRecibido}).`
                     : '';
 
-                const promptAudio = `Escucha esta nota de voz, entiende lo que te digo o pido en el audio y respóndeme o ejecuta la tarea directamente en español.${contextoImagen}`;
-                const respuesta = await consultarGemini(promptAudio, media);
+                const promptAudio = `Fran acaba de enviar una nota de voz guardada en ${tempAudioPath}.${contextoImagen} Si hay una herramienta CLI de transcripción disponible o si necesitas inspeccionar el archivo, usa ejecutar_comando_linux; de lo contrario indícale que el archivo quedó guardado en ${tempAudioPath}.`;
+                const respuesta = await consultarOllama(promptAudio);
                 await responderEnGrupoBot(message, respuesta);
-                console.log('[Gemini -> WhatsApp]: Respuesta a nota de voz enviada.');
             }
         } catch (error) {
             console.error('Error al procesar la nota de voz:', error);
@@ -406,7 +456,7 @@ client.on('message_create', async (message) => {
 
     // Soporte para imágenes, stickers y documentos
     if (message.type === 'image' || message.type === 'document' || message.type === 'sticker') {
-        console.log(`[WhatsApp -> Gemini]: Archivo multimedia (${message.type}) recibido. Descargando y procesando...`);
+        console.log(`[WhatsApp -> Ollama]: Archivo multimedia (${message.type}) recibido.`);
         try {
             const media = await descargarMediaSeguro(message);
             if (media && media.data) {
@@ -424,12 +474,11 @@ client.on('message_create', async (message) => {
                 console.log(`Archivo guardado en ${tempMediaPath} (${buffer.length} bytes).`);
 
                 const promptMedia = comentario
-                    ? `He enviado este archivo (también guardado localmente en ${tempMediaPath}) junto con este mensaje: "${comentario}". Analízalo y ejecuta la tarea o respóndeme directamente en español.`
-                    : `He enviado este archivo (también guardado localmente en ${tempMediaPath}). Dime brevemente qué ves y queda atento por si te envío instrucciones en el siguiente mensaje o nota de voz.`;
+                    ? `He enviado un archivo guardado localmente en ${tempMediaPath} con este mensaje: "${comentario}". Usa ejecutar_comando_linux si necesitas inspeccionarlo o procesarlo.`
+                    : `He enviado un archivo que quedó guardado en ${tempMediaPath}. Confírmame que lo recibiste y queda atento a mis instrucciones.`;
 
-                const respuesta = await consultarGemini(promptMedia, media);
+                const respuesta = await consultarOllama(promptMedia);
                 await responderEnGrupoBot(message, respuesta);
-                console.log('[Gemini -> WhatsApp]: Respuesta a imagen/archivo enviada.');
             }
         } catch (error) {
             console.error('Error al procesar la imagen/archivo:', error);
@@ -452,23 +501,23 @@ client.on('message_create', async (message) => {
         } catch (_) {}
         inicializarChat();
         ultimoArchivoRecibido = null;
-        await responderEnGrupoBot(message, 'Conversación reiniciada. ¿En qué trabajamos ahora?');
+        await responderEnGrupoBot(message, 'Memoria de Ollama reiniciada. ¿En qué trabajamos ahora?');
         return;
     }
 
-    console.log(`[WhatsApp -> Gemini]: ${texto}`);
+    console.log(`[WhatsApp -> Ollama]: ${texto}`);
 
     try {
         const promptTexto = ultimoArchivoRecibido
-            ? `${texto}\n\n[Contexto automático: El último archivo/imagen enviado por Fran está guardado en ${ultimoArchivoRecibido}]`
+            ? `${texto}\n\n[Contexto automático: El último archivo enviado por Fran está guardado en ${ultimoArchivoRecibido}]`
             : texto;
-        const respuesta = await consultarGemini(promptTexto);
+        const respuesta = await consultarOllama(promptTexto);
         await responderEnGrupoBot(message, respuesta);
-        console.log('[Gemini -> WhatsApp]: Respuesta enviada.');
+        console.log('[Ollama -> WhatsApp]: Respuesta enviada.');
     } catch (error) {
         console.error('Error al procesar mensaje:', error);
         try {
-            await responderEnGrupoBot(message, `Hubo un inconveniente al procesar tu mensaje: ${error.message}`);
+            await responderEnGrupoBot(message, `Hubo un inconveniente con Ollama local: ${error.message}`);
         } catch (sendErr) {
             console.error('No se pudo enviar el mensaje de error a WhatsApp:', sendErr);
         }
