@@ -2,5 +2,13 @@ node_modules/
 .wwebjs_auth/
 .wwebjs_cache/
 .env
+.env.*
+*.env
+*.save
+.gemini_history.json
+.ollama_history.json
 .agy_conversation_id
+*.ogg
+*.mp3
+*.wav
 *.log
